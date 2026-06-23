@@ -8,7 +8,7 @@
   },
   "homepage": "https://github.com/fivetaku/insane-search",
   "repository": "https://github.com/fivetaku/insane-search",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "keywords": [
     "web-access",
     "search",
