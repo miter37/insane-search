@@ -250,10 +250,10 @@ python3 -c "import curl_cffi,bs4,yaml; v=curl_cffi.__version__.split('.'); asser
   || pip install -U "curl_cffi>=0.15.0" beautifulsoup4 pyyaml -q
 ```
 
-Playwright 로컬 경로 사용 시 Node가 필요:
+Playwright 로컬 경로 사용 시 Node가 필요. 로컬 의존성은 `engine/templates/`의 package.json으로 관리한다 (executor가 그 디렉토리를 cwd로 실행). **Patchright**는 Playwright drop-in 포크로, Cloudflare/DataDome이 감지하는 CDP `Runtime.enable` 누출을 막아준다 — 템플릿이 설치돼 있으면 최우선 사용하고, 없으면 playwright-extra+stealth → plain playwright로 폴백한다:
 ```bash
-npm i -g playwright playwright-extra puppeteer-extra-plugin-stealth
-npx playwright install chrome
+cd "${CLAUDE_PLUGIN_ROOT}/skills/insane-search/engine/templates" && npm install
+npx patchright install chrome   # 시스템 Chrome 채널 (channel:'chrome' 사용)
 ```
 
 ## 빠른 참조 — Phase 0 명령어

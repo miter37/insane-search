@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.1 — 2026-07-02
+
+Activate the Patchright fallback and align the self-learning host key.
+
+- **Patchright activated** (`engine/templates/package.json`): added `patchright` (^1.61.1) as a dependency. The real-Chrome template (`playwright_real_chrome.js`) already *preferred* `require('patchright')`, but the package was never declared, so it always fell back to playwright-extra+stealth. Patchright is a Playwright-API-compatible drop-in fork that patches the CDP `Runtime.enable` (console-attach) leak that Cloudflare/DataDome-class detection now keys on — verified end-to-end (`automation:patchright`, HTTP 200, real HTML). When patchright is absent the template still falls back to playwright-extra+stealth → plain playwright, all on `channel:'chrome'`.
+- **Learning host-key fix** (`engine/learning.py`): `key_for` used `urlsplit().netloc` (keeps port + userinfo) while the session pool and Playwright profile dir key on `hostname` (`transport._host_of`, `executor._profile_dir_for`). A URL with a port therefore *learned* under a different key than it *fetched* under. Switched to `hostname` so the learned route, warm session, and browser profile all share one host key.
+- **Docs**: `SKILL.md` + `references/playwright.md` install instructions updated to the local `engine/templates` npm install with `npx patchright install chrome`.
+- Full engine regression 59/59; `bias_check` clean.
+
 ## 0.9.0 — 2026-06-28
 
 Prompt-injection surface hardening for fetched public web content.
