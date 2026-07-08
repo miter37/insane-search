@@ -1,5 +1,7 @@
 [English](README.md) | 한국어 | [中文](README.zh.md) | [日本語](README.ja.md) | [Español](README.es.md)
 
+> **포크 알림** — 이 저장소는 [fivetaku/insane-search](https://github.com/fivetaku/insane-search)의 포크로, [@miter37](https://github.com/miter37)가 관리합니다. 업스트림 코드 위에 [PR #8](https://github.com/fivetaku/insane-search/pull/8) (v0.10.0, 업스트림 리뷰 대기 중)의 9가지 추가 업그레이드를 포함합니다 — JS shell 감지, 봇 월 분류, transient 상태 재시도, body size cap, 다중 전략 컨텐츠 추출 (trafilatura → JSON-LD → `__NEXT_DATA__` → og:description → crude), PDF 추출, Playwright render-merge, 쿠키 배너 제거, 무거운 리소스 차단. 자세한 내용은 [CHANGELOG.md](./CHANGELOG.md) 참고. **업스트림 릴리스를 원하시면 `fivetaku/insane-search`를, 추출 / 복구 기능까지 사용하시려면 이 포크를 사용하세요.**
+
 <div align="center">
 
 # insane-search

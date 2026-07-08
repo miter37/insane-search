@@ -1,5 +1,7 @@
 [English](README.md) | [한국어](README.ko.md) | 中文 | [日本語](README.ja.md) | [Español](README.es.md)
 
+> **Fork 提示** — 这是 [fivetaku/insane-search](https://github.com/fivetaku/insane-search) 的一个 fork,由 [@miter37](https://github.com/miter37) 维护。在上游代码的基础上,包含了 [PR #8](https://github.com/fivetaku/insane-search/pull/8) (v0.10.0,等待上游审阅) 的 9 项向后兼容的升级:JS shell 检测、bot-wall 分类、瞬态状态重试、body 大小上限、多策略内容提取 (trafilatura → JSON-LD → `__NEXT_DATA__` → og:description → crude)、PDF 提取、Playwright render-merge、cookie 横幅移除、重量级资源拦截。完整列表请见 [CHANGELOG.md](./CHANGELOG.md)。**如果您想要上游发布版,请使用 `fivetaku/insane-search`;若要使用额外的提取 / 恢复功能,请使用本 fork。**
+
 <div align="center">
 
 # insane-search

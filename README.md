@@ -1,5 +1,7 @@
 English | [한국어](README.ko.md) | [中文](README.zh.md) | [日本語](README.ja.md) | [Español](README.es.md)
 
+> **Fork notice** — This is a fork of [fivetaku/insane-search](https://github.com/fivetaku/insane-search) maintained by [@miter37](https://github.com/miter37). It includes the upstream codebase plus [PR #8](https://github.com/fivetaku/insane-search/pull/8) (v0.10.0, awaiting upstream review): 9 backward-compatible upgrades — JS shell detection, bot-wall classification, transient-status retry, body size cap, multi-strategy content extraction (trafilatura → JSON-LD → `__NEXT_DATA__` → og:description → crude), PDF extraction, Playwright render-merge, cookie banner removal, heavy-resource blocking. See [CHANGELOG.md](./CHANGELOG.md) for the full list. **Use `fivetaku/insane-search` if you want the upstream release; use this fork for the additional extraction / recovery features.**
+
 <div align="center">
 
 # insane-search

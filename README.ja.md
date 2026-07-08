@@ -1,5 +1,7 @@
 [English](README.md) | [한국어](README.ko.md) | [中文](README.zh.md) | 日本語 | [Español](README.es.md)
 
+> **フォーク通知** — これは [fivetaku/insane-search](https://github.com/fivetaku/insane-search) のフォークで、[@miter37](https://github.com/miter37) が保守しています。アップストリームのコードに加えて、[PR #8](https://github.com/fivetaku/insane-search/pull/8) (v0.10.0、アップストリームのレビュー待ち) の 9 つの後方互換アップグレードを含みます — JS シェル検出、bot-wall 分類、トランジエント状態のリトライ、body サイズ上限、マルチ戦略コンテンツ抽出 (trafilatura → JSON-LD → `__NEXT_DATA__` → og:description → crude)、PDF 抽出、Playwright render-merge、クッキーバナー除去、重いリソースのブロック。詳細は [CHANGELOG.md](./CHANGELOG.md) を参照。**アップストリームのリリースを使用したい場合は `fivetaku/insane-search` を、抽出 / 復旧機能も使う場合はこのフォークをご利用ください。**
+
 <div align="center">
 
 # insane-search
