@@ -26,7 +26,9 @@ async function buildEnvelope(ctx, page, html, resp, automation) {
   try { finalUrl = page.url(); } catch (_e) {}
   let status = 0;
   try { status = resp ? resp.status() : 0; } catch (_e) {}
-  return JSON.stringify({ html, finalUrl, status, cookies, userAgent, automation });
+  let innerText = '';
+  try { innerText = await page.evaluate(() => document.body && document.body.innerText || ''); } catch (_e) {}
+  return JSON.stringify({ html, finalUrl, status, cookies, userAgent, automation, innerText });
 }
 
 async function readStdinJson() {
@@ -84,6 +86,18 @@ async function main() {
       ...dev,
     });
     const page = await ctx.newPage();
+
+    // Block heavy resource types so mobile render time stays in DOM.
+    try {
+      await page.route('**/*', (route) => {
+        const rt = route.request().resourceType();
+        if (rt === 'image' || rt === 'media' || rt === 'font' || rt === 'stylesheet') {
+          return route.abort();
+        }
+        return route.continue();
+      });
+    } catch (_e) {}
+
     const deadline = Date.now() + timeoutMs;
     const rem = (cap) => Math.max(1000, Math.min(cap || timeoutMs, deadline - Date.now()));
     const mainResp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: rem(90000) });
@@ -93,6 +107,21 @@ async function main() {
         await page.waitForSelector(waitSelector, { timeout: rem(20000) });
       } catch (_e) {}
     }
+
+    // Strip cookie / consent / modal overlays before extracting body text.
+    try {
+      await page.evaluate(() => {
+        const sels = [
+          '[id*="cookie" i]', '[class*="cookie" i]',
+          '[id*="consent" i]', '[class*="consent" i]',
+          '[id*="banner" i]', '[class*="banner" i]',
+          '[id*="modal" i]', '[class*="modal" i]',
+          '[id*="popup" i]', '[class*="popup" i]',
+          '[id*="overlay" i]', '[class*="overlay" i]'
+        ];
+        document.querySelectorAll(sels.join(',')).forEach((e) => e.remove());
+      });
+    } catch (_e) {}
 
     const html = await page.content();
     const payload = await buildEnvelope(ctx, page, html, mainResp, automation);

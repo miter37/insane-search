@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.10.0 — 2026-07-08
+
+Crawl-success rate and output quality — **9 techniques that increase the rate at which the engine produces a clean, citable body and recovers from a fetch that would otherwise have been reported as a failure**. Every change is backward compatible: existing call sites and `Verdict` set unchanged, only additions.
+
+**Tier 1 — recover cases that were previously reported as failure**
+- **`JS_SHELL` verdict** (`validators.py`): empty React/Next/Nuxt mount points (`<div id="root"></div>`, `__next`, etc.) are detected via two paths — explicit empty mount element, or framework marker (`data-reactroot` / `__NEXT_DATA__` / `ng-version` / SPA root id) with under 200 chars of visible text. Non-terminal so the chain queues Playwright fallback instead of declaring success on an empty mount. The "bare `<script src=...>`" false positive is explicitly excluded — it would match Cloudflare challenge pages, ad scripts, and analytics.
+- **`BOT_WALL_SUSPECTED` verdict** (`validators.py`): a non-2xx response carrying a hard challenge marker is promoted from `CHALLENGE` to terminal `BOT_WALL_SUSPECTED`. Prevents soft-404 / bot-wall bodies from leaking into LLM citations as if they were the real page.
+- **Transient-status retry with exponential backoff** (`transport.py`): 429/502/503/504 are retried in-place on the same TLS identity (1.5s · 3s · 6s, max 3 calls) before the caller sees the response. Different impersonation never helped with rate-limit recovery; this closes that gap. 404/401/407 are not retried.
+- **8MB body size cap** (`transport.py`): streamed chunks are truncated and `resp._truncated_download` is set so callers can tell a clipped download from a complete one. Prevents OOM on misconfigured endpoints / WAF DoS bodies.
+
+**Tier 2 — extract a clean body from the response we already have**
+- **Multi-strategy content extraction chain** (`fetch_chain.py`): on success, the response body is run through `trafilatura → JSON-LD articleBody → __NEXT_DATA__/__NUXT__/__PRELOADED_STATE__/__APOLLO_STATE__ → og:description / meta description → crude HTML strip`. Each stage only fires if the previous returned thin/empty content, so a successful trafilatura extraction short-circuits. Result replaces raw HTML in `FetchResult.content`.
+- **PDF extraction** (`fetch_chain.py`): `%PDF-` magic byte sniff OR explicit content-type OR `.pdf` URL routes the body through `pypdf` (80-page cap, no-text-layer error for scanned PDFs).
+- **Playwright render-merge** (`executor.py` + `playwright_real_chrome.js` / `playwright_mobile_chrome.js`): `innerText` is emitted alongside the rendered HTML. Many SPAs only expose visible text via `innerText`; the chain compares `innerText` length against the extracted markdown and keeps the longer one.
+- **Cookie banner / consent modal removal** (`playwright_real_chrome.js` / `playwright_mobile_chrome.js`): a single `page.evaluate` strips `[id*="cookie" i]`, `[class*="consent" i]`, `[id*="modal" i]`, etc. before extraction. Rescues EU sites where the GDPR prompt overlays the real body.
+- **Heavy resource blocking** (`playwright_real_chrome.js` / `playwright_mobile_chrome.js`): `page.route` aborts `image / media / font / stylesheet`. Cuts render time without affecting text extraction.
+
+**New public-API surface (all defaults preserve prior behavior)**
+- `fetch()` kwargs: `enable_extraction` (default `True`), `enable_retry` (default `True`), `max_download_bytes` (default `None` = 8MB)
+- `POOL.request()` kwargs: `max_download_bytes`, `max_retries`
+- `FetchResult` fields: `extraction_quality: float`, `extraction_source: str`, `extraction_meta: dict`
+- `Verdict` enum: `JS_SHELL`, `BOT_WALL_SUSPECTED` (latter added to `TERMINAL_NONSUCCESS`; `JS_SHELL` is intentionally non-terminal)
+- CLI flags: `--no-extract`, `--no-retry`, `--max-download-mb N`
+
+**Tests** (all in `engine/tests/`)
+- `test_t1_1_js_shell.py` (8): JS shell detection across React/Next mounts, bot wall classification, terminal-set membership
+- `test_t1_3_retry.py` (6): 429/503/404/200 sequence, oversized body truncation + tag
+- `test_t2_6_extraction.py` (10): each extraction strategy, render-merge, PDF magic-byte detection, FetchResult metadata
+- `test_u4.py`: existing envelope-parse tests updated for the new 7-tuple return (innerText added; backward compat with old 6-tuple callers documented)
+
+**Compatibility**
+- No existing `Verdict` removed; `TERMINAL_NONSUCCESS` only gains `BOT_WALL_SUSPECTED`
+- `phase0`, `learning`, `waf_detector`, `safety`, `url_transforms`, `content_safety` untouched
+- No-Site-Name Rule preserved (R3) — no site-specific branches anywhere
+- 24 new tests + 24 pre-existing tests, all passing; full engine regression 45/45
+
 ## 0.9.1 — 2026-07-02
 
 Activate the Patchright fallback and align the self-learning host key.

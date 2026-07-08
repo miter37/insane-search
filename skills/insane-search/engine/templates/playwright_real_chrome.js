@@ -27,6 +27,8 @@ function writeStdoutAsync(payload) {
 
 // Structured envelope so the Python side can (a) validate on real status /
 // final URL and (b) bridge the browser-cleared cookies + UA into curl_cffi.
+// innerText (Tier 2-8) is emitted so the extractor can compare it against
+// trafilatura output and pick whichever is longer for SPA pages.
 async function buildEnvelope(ctx, page, html, resp, automation) {
   let cookies = [];
   try { cookies = (await ctx.cookies()).map((c) => ({ name: c.name, value: c.value, domain: c.domain })); } catch (_e) {}
@@ -36,7 +38,9 @@ async function buildEnvelope(ctx, page, html, resp, automation) {
   try { finalUrl = page.url(); } catch (_e) {}
   let status = 0;
   try { status = resp ? resp.status() : 0; } catch (_e) {}
-  return JSON.stringify({ html, finalUrl, status, cookies, userAgent, automation });
+  let innerText = '';
+  try { innerText = await page.evaluate(() => document.body && document.body.innerText || ''); } catch (_e) {}
+  return JSON.stringify({ html, finalUrl, status, cookies, userAgent, automation, innerText });
 }
 
 async function readStdinJson() {
@@ -99,6 +103,20 @@ async function main() {
     }
     ctx = await chromium.launchPersistentContext(profileDir, ctxOpts);
     const page = await ctx.newPage();
+
+    // Block heavy resource types so render time goes into DOM, not assets.
+    // image/media/font/stylesheet are unnecessary for text extraction; script
+    // is kept so SPAs and WAF sensor JS can still execute.
+    try {
+      await page.route('**/*', (route) => {
+        const rt = route.request().resourceType();
+        if (rt === 'image' || rt === 'media' || rt === 'font' || rt === 'stylesheet') {
+          return route.abort();
+        }
+        return route.continue();
+      });
+    } catch (_e) { /* route registration is best-effort */ }
+
     // Single shared deadline across warmup + main + reload navigations so the
     // first nav can't eat the whole budget and starve the rest.
     const deadline = Date.now() + timeoutMs;
@@ -146,6 +164,23 @@ async function main() {
       // Without a positive-proof selector, give the sensor a couple more seconds.
       await page.waitForTimeout(2000);
     }
+
+    // Strip cookie consent banners, modals, and overlays so the extracted
+    // body text is not polluted by GDPR/CCPA prompts. Best-effort: failure
+    // does not block returning whatever HTML we have.
+    try {
+      await page.evaluate(() => {
+        const sels = [
+          '[id*="cookie" i]', '[class*="cookie" i]',
+          '[id*="consent" i]', '[class*="consent" i]',
+          '[id*="banner" i]', '[class*="banner" i]',
+          '[id*="modal" i]', '[class*="modal" i]',
+          '[id*="popup" i]', '[class*="popup" i]',
+          '[id*="overlay" i]', '[class*="overlay" i]'
+        ];
+        document.querySelectorAll(sels.join(',')).forEach((e) => e.remove());
+      });
+    } catch (_e) { /* best-effort */ }
 
     const html = await page.content();
     const payload = await buildEnvelope(ctx, page, html, mainResp, automation);

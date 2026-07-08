@@ -14,7 +14,7 @@ site-specific logic.
 
 Playwright MCP invocation requires caller's tool access; this module
 provides the subprocess path for local JS templates but only stubs the MCP
-path (MCP must be driven from the Claude session itself).
+path (MCP must be driven from the agent (opencode) session itself).
 """
 from __future__ import annotations
 
@@ -155,8 +155,10 @@ def run_playwright_fallback(
 
     if choice.startswith("playwright_mcp"):
         att.error = (
-            "Playwright MCP must be invoked from the Claude session — "
-            "call mcp__playwright__* tools directly instead of fetch_chain."
+            "Playwright/browser fallback must be invoked from the agent session — "
+            "use opencode mcp Playwright tools (if configured) or the local Node "
+            "template (engine/templates/playwright_real_chrome.js) directly "
+            "instead of fetch_chain."
         )
         att.verdict = Verdict.UNKNOWN.value
         att.elapsed_s = round(time.time() - t0, 3)
@@ -202,9 +204,10 @@ def run_playwright_fallback(
         att.verdict = Verdict.UNKNOWN.value
         return att, ""
 
-    # stdout is a JSON envelope {html, finalUrl, status, cookies, userAgent}.
-    # Fall back to treating raw stdout as HTML for forward/backward compat.
-    html, final_url, status, cookies, user_agent, automation = _parse_envelope(stdout, url)
+    # stdout is a JSON envelope {html, finalUrl, status, cookies, userAgent,
+    # innerText}. Fall back to treating raw stdout as HTML for forward/backward
+    # compat (older templates that did not emit a JSON envelope).
+    html, final_url, status, cookies, user_agent, automation, inner_text = _parse_envelope(stdout, url)
 
     resp = _FakeResp(html, status=status, final_url=final_url)
     vr = validate(resp, success_selectors=success_selectors)
@@ -220,12 +223,23 @@ def run_playwright_fallback(
     if vr.verdict in (Verdict.STRONG_OK, Verdict.WEAK_OK) and cookies:
         _bridge_cookies_to_pool(url, cookies, user_agent)
 
+    # innerText is stashed on the attempt for the render-merge step (Tier 2-8):
+    # many SPAs render visible text the extractor misses; the chain compares
+    # innerText length against the extracted markdown and keeps the longer one.
+    if inner_text:
+        try:
+            att._inner_text = inner_text
+        except Exception:
+            pass
+
     return att, html
 
 
 def _parse_envelope(stdout: str, url: str):
-    """Return (html, final_url, status, cookies, user_agent) from a JSON
-    envelope, or treat stdout as raw HTML if it isn't JSON."""
+    """Return (html, final_url, status, cookies, user_agent, automation,
+    inner_text) from a JSON envelope, or treat stdout as raw HTML if it isn't
+    JSON. innerText (Tier 2-8) is empty for envelopes emitted by older
+    templates that do not include it."""
     import json
     s = stdout.lstrip()
     if s[:1] == "{":
@@ -237,10 +251,11 @@ def _parse_envelope(stdout: str, url: str):
             cookies = env.get("cookies") or []
             user_agent = env.get("userAgent") or None
             automation = env.get("automation") or None
-            return html, final_url, status, cookies, user_agent, automation
+            inner_text = env.get("innerText") or ""
+            return html, final_url, status, cookies, user_agent, automation, inner_text
         except Exception:
             pass
-    return stdout, url, 200, [], None, None
+    return stdout, url, 200, [], None, None, ""
 
 
 def _bridge_cookies_to_pool(url: str, cookies: list, user_agent: Optional[str]) -> None:

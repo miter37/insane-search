@@ -103,6 +103,12 @@ class FetchResult:
     prompt_injection_risk: str = ""
     prompt_injection_signals: list[str] = field(default_factory=list)
     untrusted_content_boundary: dict[str, str] = field(default_factory=dict)
+    # Extraction metadata (Tier 2): the extracted markdown replaces raw HTML in
+    # `content`, so callers get clean text + a quality score + which strategy
+    # produced it (trafilatura / json_ld / next_data / meta / pdf / crude).
+    extraction_quality: float = 0.0
+    extraction_source: str = ""
+    extraction_meta: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         report = analyze_untrusted_content(self.content, source_url=self.final_url)
@@ -146,12 +152,257 @@ class FetchResult:
             "prompt_injection_risk": self.prompt_injection_risk,
             "prompt_injection_signals": self.prompt_injection_signals,
             "untrusted_content_boundary": self.untrusted_content_boundary,
+            "extraction_quality": self.extraction_quality,
+            "extraction_source": self.extraction_source,
+            "extraction_meta": self.extraction_meta,
         }
+
+
+# --- Content extraction chain (Tier 2: rescue empty / SPA / PDF bodies) ------
+# Mirrors deepfetch's fallback order: trafilatura → JSON-LD articleBody →
+# Next/Nuxt embedded state → og:description → crude HTML strip. PDF bodies
+# are routed to pypdf. Both trafilatura and pypdf are optional imports; the
+# chain degrades gracefully when a library is unavailable.
+import io as _io
+import json as _json
+import re as _re
+
+try:
+    import trafilatura as _trafilatura
+except ImportError:
+    _trafilatura = None
+
+try:
+    from pypdf import PdfReader as _PdfReader
+except ImportError:
+    _PdfReader = None
+
+
+def _quality_score(md: str) -> float:
+    """Crude 0..1 extraction-quality heuristic: length + sentence density.
+    Returned to the caller so they can decide whether to retry with render."""
+    if not md:
+        return 0.0
+    n = len(md)
+    length_s = min(n / 3000.0, 1.0)
+    sentences = len(_re.findall(r"[.!?。다\.]\s", md)) + 1
+    words = max(len(md.split()), 1)
+    struct_s = min(sentences / (words / 18.0 + 1), 1.0)
+    return round(max(0.0, min(1.0, 0.6 * length_s + 0.4 * struct_s)), 2)
+
+
+def _extract_json_ld_text(html: str) -> str:
+    """Pull articleBody / description from <script type=application/ld+json>."""
+    out: list[str] = []
+    for m in _re.finditer(
+            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, _re.I | _re.S):
+        try:
+            data = _json.loads(m.group(1))
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            if isinstance(data, dict):
+                t = (data.get("@type") or "")
+                if t in ("Article", "NewsArticle", "BlogPosting") or "articleBody" in data:
+                    body = data.get("articleBody") or data.get("description") or ""
+                    if body:
+                        out.append(body)
+        except Exception:
+            pass
+    return "\n\n".join(out)
+
+
+def _extract_next_data_text(html: str) -> str:
+    """Walk Next.js __NEXT_DATA__ / Nuxt __NUXT__ / __PRELOADED_STATE__
+    embedded JSON, harvest strings > 20 chars (the actual article body often
+    lives here when the visible DOM is an empty React mount)."""
+    out: list[str] = []
+
+    def walk(obj):
+        if isinstance(obj, str):
+            if len(obj.strip()) > 20:
+                out.append(obj.strip())
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+
+    # Shape 1: <script id="__NEXT_DATA__" type="application/json">{...}</script>
+    for m in _re.finditer(
+            r'<script[^>]*\bid=["\'](?:__NEXT_DATA__|__NUXT_DATA__)["\'][^>]*>(.*?)</script>',
+            html, _re.I | _re.S):
+        try:
+            walk(_json.loads(m.group(1)))
+        except Exception:
+            pass
+    # Shape 2: window.__NUXT__ / __PRELOADED_STATE__ / __APOLLO_STATE__ = {...}
+    for m in _re.finditer(
+            r'(?:__NUXT__|window\.__PRELOADED_STATE__|__APOLLO_STATE__)\s*=\s*(\{.*?\})\s*(?:;|</script>)',
+            html, _re.I | _re.S):
+        try:
+            walk(_json.loads(m.group(1)))
+        except Exception:
+            pass
+    combined = "\n\n".join(dict.fromkeys(out))
+    return combined if len(combined) > 100 else ""
+
+
+def _extract_metadata_fallback(html: str) -> str:
+    """og:description → meta description. Last resort before crude strip."""
+    m = _re.search(
+        r'<meta[^>]*property=["\']og:description["\'][^>]*content=["\']([^"\']+)["\']',
+        html, _re.I)
+    if not m:
+        m = _re.search(
+            r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\']+)["\']',
+            html, _re.I)
+    return f"[Metadata Fallback]\n{m.group(1).strip()}" if m else ""
+
+
+def _extract_html_chain(html: str, url: str) -> tuple[str, str, float, str]:
+    """Returns (title, markdown, quality, source).
+
+    Strategy: trafilatura → JSON-LD → __NEXT_DATA__ → og:description → crude
+    strip. Each stage only fires if the previous returned thin/empty content,
+    so a successful trafilatura extraction short-circuits the rest."""
+    title = ""
+    m = _re.search(r"<title[^>]*>(.*?)</title>", html, _re.I | _re.S)
+    if m:
+        title = _re.sub(r"\s+", " ", m.group(1)).strip()[:300]
+
+    if _trafilatura is not None:
+        try:
+            md = _trafilatura.extract(
+                html, url=url, output_format="markdown",
+                include_links=True, include_tables=True, favor_recall=True)
+            if md and len(md.strip()) > 80:
+                md = md.strip()
+                return title, md, _quality_score(md), "trafilatura"
+        except Exception:
+            pass
+
+    txt = _extract_json_ld_text(html)
+    if txt and len(txt) > 100:
+        return title, txt, _quality_score(txt), "json_ld"
+
+    txt = _extract_next_data_text(html)
+    if txt and len(txt) > 100:
+        return title, txt, _quality_score(txt), "next_data"
+
+    txt = _extract_metadata_fallback(html)
+    if txt:
+        return title, txt, _quality_score(txt), "meta"
+
+    crude = _re.sub(r"<(script|style|nav|footer|header)[^>]*>.*?</\1>", " ",
+                    html, flags=_re.I | _re.S)
+    crude = _re.sub(r"<[^>]+>", " ", crude)
+    crude = _re.sub(r"\s+", " ", crude).strip()
+    return title, crude[:5000], _quality_score(crude[:5000]), "crude"
+
+
+def _extract_pdf(body: bytes, url: str) -> tuple[str, str, float, str]:
+    """Returns (title, text, quality, error_code). error_code is "" on success.
+    Caps at 80 pages to keep token budget sane; reports pdf_no_text_layer for
+    scanned PDFs (so the caller knows rendering will not help either)."""
+    if _PdfReader is None:
+        return "", "", 0.0, "pypdf_missing"
+    try:
+        reader = _PdfReader(_io.BytesIO(body))
+        title = ""
+        try:
+            if reader.metadata and reader.metadata.title:
+                title = str(reader.metadata.title)[:300]
+        except Exception:
+            pass
+        pages: list[str] = []
+        for page in reader.pages[:80]:
+            try:
+                pages.append(page.extract_text() or "")
+            except Exception:
+                pages.append("")
+        text = "\n\n".join(p for p in pages if p).strip()
+        if not text:
+            return title, "", 0.0, "pdf_no_text_layer"
+        return title, text, _quality_score(text), ""
+    except Exception as e:
+        return "", "", 0.0, f"pdf_error:{type(e).__name__}"
+
+
+def _looks_like_pdf(resp, final_url: str) -> bool:
+    """Detect PDF by magic bytes OR explicit content-type OR .pdf URL.
+    Avoids the case where a server serves a PDF with text/html content-type."""
+    body = getattr(resp, "content", None)
+    if isinstance(body, (bytes, bytearray)) and len(body) >= 5 and body[:5] == b"%PDF-":
+        return True
+    try:
+        ctype = (dict(getattr(resp, "headers", {}) or {}).get("content-type", "") or "").lower()
+    except Exception:
+        ctype = ""
+    if "pdf" in ctype:
+        return True
+    return final_url.lower().split("?")[0].endswith(".pdf")
+
+
+def _extract_response(resp, final_url: str, inner_text: str = "") -> tuple[str, str, float, dict]:
+    """Run the right extractor for the content-type.
+
+    Returns (title, content, quality, meta). meta = {source, error, truncated,
+    inner_text_used}. The chain degrades gracefully: a missing extractor or a
+    parse failure falls through to raw text so the LLM always has SOMETHING.
+
+    inner_text (Tier 2-8): when supplied (Playwright fallback), compare its
+    length against the trafilatura/strategy output and keep whichever is
+    longer — many SPAs only expose visible text via innerText."""
+    truncated = bool(getattr(resp, "_truncated_download", False))
+
+    if _looks_like_pdf(resp, final_url):
+        body = getattr(resp, "content", None)
+        if isinstance(body, (bytes, bytearray)) and body:
+            # only treat as PDF if it really starts with %PDF- OR content-type says pdf
+            ctype_pdf = False
+            try:
+                ctype_pdf = "pdf" in (dict(getattr(resp, "headers", {}) or {})
+                                      .get("content-type", "") or "").lower()
+            except Exception:
+                pass
+            if body[:5] == b"%PDF-" or ctype_pdf:
+                title, text, quality, err = _extract_pdf(body, final_url)
+                if text:
+                    return title, text, quality, {"source": "pdf", "error": err or "",
+                                                  "truncated": truncated, "inner_text_used": False}
+                return title, f"[PDF binary, {len(body)} bytes; extractor={err or 'ok'}]", \
+                       0.0, {"source": "pdf", "error": err, "truncated": truncated,
+                             "inner_text_used": False}
+
+    text = getattr(resp, "text", "") or ""
+    if not text:
+        body = getattr(resp, "content", None)
+        if isinstance(body, (bytes, bytearray)):
+            return "", f"[{len(body)} bytes; binary]", 0.0, \
+                   {"source": "raw_binary", "error": "no_text_body",
+                    "truncated": truncated, "inner_text_used": False}
+        return "", "", 0.0, {"source": "empty", "error": "empty_body",
+                             "truncated": truncated, "inner_text_used": False}
+
+    title, md, quality, source = _extract_html_chain(text, final_url)
+    inner_used = False
+    # Render-merge (Tier 2-8): SPAs often have visible text in innerText that
+    # trafilatura cannot see. Keep the longer of the two.
+    if inner_text and len(inner_text.strip()) > max(len(md), 200):
+        md = inner_text.strip()
+        quality = _quality_score(md)
+        source = source + "+inner_text"
+        inner_used = True
+    return title, md, quality, {"source": source, "error": "",
+                                "truncated": truncated, "inner_text_used": inner_used}
 
 
 # --- curl_cffi probe executor ------------------------------------------------
 def _curl_probe(
-    url: str, *, impersonate: str, referer: str, timeout: int = 20
+    url: str, *, impersonate: str, referer: str, timeout: int = 20,
+    enable_retry: bool = True, max_download_bytes: Optional[int] = None,
 ) -> tuple[Any, Optional[str]]:
     """Returns (response, error_str). response may be None on exception.
 
@@ -160,7 +411,11 @@ def _curl_probe(
     The pool degrades to a one-shot GET when a Session can't be created.
     """
     from .transport import POOL
-    return POOL.request(url, impersonate=impersonate, referer=referer, timeout=timeout)
+    return POOL.request(
+        url, impersonate=impersonate, referer=referer, timeout=timeout,
+        max_retries=2 if enable_retry else 0,
+        max_download_bytes=max_download_bytes,
+    )
 
 
 def _run_attempt(
@@ -173,11 +428,16 @@ def _run_attempt(
     known_bad_sizes: Optional[list[int]],
     timeout: int,
     phase: str,
+    enable_retry: bool = True,
+    max_download_bytes: Optional[int] = None,
 ) -> tuple[Attempt, Any]:
     """Execute one curl_cffi attempt and produce an Attempt record."""
     referer_url = REFERER_STRATEGIES.get(referer_name, REFERER_STRATEGIES["none"])(url)
     t0 = time.time()
-    resp, err = _curl_probe(url, impersonate=impersonate, referer=referer_url, timeout=timeout)
+    resp, err = _curl_probe(
+        url, impersonate=impersonate, referer=referer_url, timeout=timeout,
+        enable_retry=enable_retry, max_download_bytes=max_download_bytes,
+    )
     elapsed = round(time.time() - t0, 3)
 
     att = Attempt(
@@ -357,6 +617,9 @@ def fetch(
     enable_playwright: bool = True,
     enable_phase0: bool = True,
     enable_learning: bool = True,
+    enable_extraction: bool = True,
+    enable_retry: bool = True,
+    max_download_bytes: Optional[int] = None,
 ) -> FetchResult:
     """Public entrypoint — the generic grid wrapped with per-host self-learning.
 
@@ -368,7 +631,19 @@ def fetch(
 
     The store is a bounded, self-pruning JSON file; any error in it is swallowed
     so learning can never break a fetch. Disable per-call with
-    ``enable_learning=False`` or globally with ``INSANE_LEARN=0``."""
+    ``enable_learning=False`` or globally with ``INSANE_LEARN=0``.
+
+    Tier 2 (extraction): when ``enable_extraction=True`` (default), the response
+    body is run through the markdown extraction chain (trafilatura → JSON-LD →
+    __NEXT_DATA__ → og:description → crude) and the resulting clean markdown
+    replaces the raw HTML in ``FetchResult.content``. PDF bodies go through
+    pypdf. Set ``enable_extraction=False`` to keep the raw response text.
+
+    Tier 1-3 (retry): when ``enable_retry=True`` (default), transient statuses
+    (429/502/503/504) are retried in-place with exponential backoff on the same
+    TLS identity before the caller sees the response. ``max_download_bytes``
+    caps the body size per attempt (default 8 MB); a clipped download is tagged
+    on ``resp._truncated_download`` and surfaced in ``extraction_meta``."""
     priority: Optional[dict] = None
     learned_existed = False
     uh = dict(user_hint or {})
@@ -389,6 +664,9 @@ def fetch(
         max_browser_attempts=max_browser_attempts,
         enable_playwright=enable_playwright, enable_phase0=enable_phase0,
         priority=priority,
+        enable_extraction=enable_extraction,
+        enable_retry=enable_retry,
+        max_download_bytes=max_download_bytes,
     )
 
     try:
@@ -421,6 +699,9 @@ def _fetch_core(
     enable_playwright: bool = True,
     enable_phase0: bool = True,
     priority: Optional[dict] = None,      # U5: learned route to retry first
+    enable_extraction: bool = True,
+    enable_retry: bool = True,
+    max_download_bytes: Optional[int] = None,
 ) -> FetchResult:
     """Fetch `url` using the generic diversity grid.
 
@@ -512,6 +793,7 @@ def _fetch_core(
         url, transform_name="original", impersonate=base_impersonate,
         referer_name=base_referer, success_selectors=success_selectors,
         known_bad_sizes=None, timeout=timeout, phase="probe",
+        enable_retry=enable_retry, max_download_bytes=max_download_bytes,
     )
     trace.append(probe_attempt)
     curl_attempts += 1
@@ -520,13 +802,15 @@ def _fetch_core(
         if probe_attempt.verdict in _OK_VALUES:
             return _build_result(probe_resp, probe_attempt, trace, profile_used=None,
                                  planned=0, executed=curl_attempts,
-                                 grid_exhausted=False, stop_reason="success")
+                                 grid_exhausted=False, stop_reason="success",
+                                 enable_extraction=enable_extraction)
         if probe_attempt.verdict == Verdict.SUSPECT_OK.value:
             best_suspect = (probe_resp, probe_attempt)
         elif probe_attempt.verdict in _TERMINAL_NONSUCCESS_VALUES:
             return _give_up(trace, profile_used, last_resp, last_attempt, best_suspect,
                             planned=0, executed=curl_attempts, grid_exhausted=False,
-                            stop_reason=probe_attempt.verdict)
+                            stop_reason=probe_attempt.verdict,
+                            enable_extraction=enable_extraction)
 
     # -------- Phase 2: detect + plan + execute ------------------------------
     if last_resp is not None:
@@ -551,6 +835,7 @@ def _fetch_core(
             referer_name=cand.referer, success_selectors=success_selectors,
             known_bad_sizes=list(cand.known_bad_sizes) if cand.known_bad_sizes else None,
             timeout=timeout, phase="grid",
+            enable_retry=enable_retry, max_download_bytes=max_download_bytes,
         )
         trace.append(att)
         curl_attempts += 1
@@ -559,7 +844,8 @@ def _fetch_core(
             if att.verdict in _OK_VALUES:
                 return _build_result(resp, att, trace, profile_used=cand.profile_id,
                                      planned=planned, executed=curl_attempts,
-                                     grid_exhausted=False, stop_reason="success")
+                                     grid_exhausted=False, stop_reason="success",
+                                     enable_extraction=enable_extraction)
             if att.verdict == Verdict.SUSPECT_OK.value and best_suspect is None:
                 best_suspect = (resp, att)
             if att.verdict in _TERMINAL_NONSUCCESS_VALUES:
@@ -594,12 +880,34 @@ def _fetch_core(
                 trace.append(pw_attempt)
                 browser_used += 1
                 if pw_attempt.verdict in _OK_VALUES:
+                    # Tier 2-8 render-merge: executor stashes the rendered
+                    # innerText on pw_attempt._inner_text; pass it through so
+                    # _extract_response can keep the longer of the two.
+                    pw_inner = getattr(pw_attempt, "_inner_text", "") or ""
+                    class _PWResp:
+                        def __init__(self, text, url, headers):
+                            self.text = text
+                            self.content = text.encode("utf-8", "ignore") if text else b""
+                            self.url = url
+                            self.status_code = 200
+                            self.headers = headers
+                            self.cookies = type("C", (), {"jar": []})()
+                    _pw_r = _PWResp(pw_content, pw_attempt.url,
+                                    {"content-type": "text/html"})
+                    title, content, quality, meta = _maybe_extract(
+                        _pw_r, pw_attempt.url,
+                        enable_extraction=enable_extraction, inner_text=pw_inner)
                     return FetchResult(
-                        ok=True, content=pw_content, final_url=pw_attempt.url,
+                        ok=True, content=content, final_url=pw_attempt.url,
                         verdict=pw_attempt.verdict, profile_used=profile_used,
-                        trace=trace, summary=f"Playwright fallback succeeded via {fb_name}",
+                        trace=trace,
+                        summary=f"Playwright fallback succeeded via {fb_name} "
+                                f"(extracted={meta.get('source')}, q={quality})",
                         planned_attempts=planned, executed_attempts=curl_attempts,
                         grid_exhausted=grid_exhausted, stop_reason="success",
+                        extraction_quality=quality,
+                        extraction_source=meta.get("source", ""),
+                        extraction_meta=meta,
                     )
                 if pw_attempt.verdict == Verdict.SUSPECT_OK.value and best_suspect is None:
                     best_suspect = (None, pw_attempt)
@@ -617,7 +925,8 @@ def _fetch_core(
     # -------- Give up, return best we have ----------------------------------
     return _give_up(trace, profile_used, last_resp, last_attempt, best_suspect,
                     planned=planned, executed=curl_attempts,
-                    grid_exhausted=grid_exhausted, stop_reason=stop_reason or "exhausted")
+                    grid_exhausted=grid_exhausted, stop_reason=stop_reason or "exhausted",
+                    enable_extraction=enable_extraction)
 
 
 def _untried_routes(stop_reason, grid_exhausted) -> tuple[list[str], bool]:
@@ -657,12 +966,33 @@ def _untried_routes(stop_reason, grid_exhausted) -> tuple[list[str], bool]:
 
 
 def _give_up(trace, profile_used, last_resp, last_attempt, best_suspect,
-             *, planned, executed, grid_exhausted, stop_reason) -> FetchResult:
-    """Return the most honest failure result, preferring suspect content."""
+             *, planned, executed, grid_exhausted, stop_reason,
+             enable_extraction: bool = True) -> FetchResult:
+    """Return the most honest failure result, preferring suspect content.
+
+    Extraction is applied to the suspect/last body when available — but with a
+    low quality threshold (0.2) below which we keep the raw text instead of an
+    obviously-broken extraction, so the LLM always has something to reason
+    about even on failure paths."""
     untried, must_mcp = _untried_routes(stop_reason, grid_exhausted)
     if best_suspect is not None:
         s_resp, s_att = best_suspect
-        content = getattr(s_resp, "text", "") if s_resp is not None else ""
+        title, content, quality, meta = ("", "", 0.0, {})
+        if s_resp is not None:
+            try:
+                title, content, quality, meta = _maybe_extract(
+                    s_resp, str(getattr(s_resp, "url", s_att.url)),
+                    enable_extraction=enable_extraction)
+            except Exception:
+                content = getattr(s_resp, "text", "") or ""
+            # If extraction quality is too low, fall back to raw text so we do
+            # not surface a clearly broken extraction as if it were the page.
+            if quality < 0.2:
+                raw = getattr(s_resp, "text", "") or ""
+                if len(raw) > len(content):
+                    content = raw
+                    meta = {"source": "raw_low_quality", "error": "",
+                            "truncated": bool(getattr(s_resp, "_truncated_download", False))}
         return FetchResult(
             ok=False, content=content or "",
             final_url=str(getattr(s_resp, "url", s_att.url)) if s_resp is not None else s_att.url,
@@ -671,10 +1001,28 @@ def _give_up(trace, profile_used, last_resp, last_attempt, best_suspect,
             planned_attempts=planned, executed_attempts=executed,
             grid_exhausted=grid_exhausted, stop_reason=stop_reason,
             untried_routes=untried, must_invoke_playwright_mcp=must_mcp,
+            extraction_quality=quality,
+            extraction_source=meta.get("source", ""),
+            extraction_meta=meta,
         )
+    last_content = getattr(last_resp, "text", "") if last_resp is not None else ""
+    last_meta: dict = {}
+    last_quality = 0.0
+    if last_resp is not None and last_content:
+        try:
+            _, last_content, last_quality, last_meta = _maybe_extract(
+                last_resp, str(getattr(last_resp, "url", url_of(last_attempt))),
+                enable_extraction=enable_extraction)
+            if last_quality < 0.2:
+                raw = getattr(last_resp, "text", "") or ""
+                if len(raw) > len(last_content):
+                    last_content = raw
+                    last_meta = {"source": "raw_low_quality"}
+        except Exception:
+            pass
     return FetchResult(
         ok=False,
-        content=getattr(last_resp, "text", "") if last_resp is not None else "",
+        content=last_content,
         final_url=str(getattr(last_resp, "url", url_of(last_attempt))) if last_resp is not None else url_of(last_attempt),
         verdict=last_attempt.verdict if last_attempt else Verdict.UNKNOWN.value,
         profile_used=profile_used, trace=trace,
@@ -682,6 +1030,9 @@ def _give_up(trace, profile_used, last_resp, last_attempt, best_suspect,
         planned_attempts=planned, executed_attempts=executed,
         grid_exhausted=grid_exhausted, stop_reason=stop_reason,
         untried_routes=untried, must_invoke_playwright_mcp=must_mcp,
+        extraction_quality=last_quality,
+        extraction_source=last_meta.get("source", ""),
+        extraction_meta=last_meta,
     )
 
 
@@ -707,18 +1058,38 @@ def fetch_many(urls: list[str], **kwargs) -> list[FetchResult]:
     return [r for r in results if r is not None]
 
 
+def _maybe_extract(resp, final_url: str, *, enable_extraction: bool, inner_text: str = "") -> tuple[str, str, float, dict]:
+    """Run the extraction chain when enabled; otherwise return raw text + a
+    minimal meta dict so FetchResult always carries consistent fields."""
+    if not enable_extraction:
+        text = getattr(resp, "text", "") or ""
+        return "", text, 0.0, {"source": "raw_disabled", "error": "",
+                               "truncated": bool(getattr(resp, "_truncated_download", False)),
+                               "inner_text_used": False}
+    return _extract_response(resp, final_url, inner_text=inner_text)
+
+
 def _build_result(resp, attempt: Attempt, trace: list[Attempt], profile_used: Optional[str],
-                  *, planned: int, executed: int, grid_exhausted: bool, stop_reason: str) -> FetchResult:
+                  *, planned: int, executed: int, grid_exhausted: bool, stop_reason: str,
+                  enable_extraction: bool = True) -> FetchResult:
+    final_url = str(getattr(resp, "url", attempt.url))
+    title, content, quality, meta = _maybe_extract(
+        resp, final_url, enable_extraction=enable_extraction)
     return FetchResult(
         ok=True,
-        content=getattr(resp, "text", "") or "",
-        final_url=str(getattr(resp, "url", attempt.url)),
+        content=content,
+        final_url=final_url,
         verdict=attempt.verdict,
         profile_used=profile_used,
         trace=trace,
-        summary=f"{attempt.executor} {attempt.impersonate} + {attempt.url_transform} + referer:{attempt.referer} → {attempt.verdict}",
+        summary=f"{attempt.executor} {attempt.impersonate} + {attempt.url_transform} + "
+                f"referer:{attempt.referer} → {attempt.verdict} "
+                f"(extracted={meta.get('source')}, q={quality})",
         planned_attempts=planned, executed_attempts=executed,
         grid_exhausted=grid_exhausted, stop_reason=stop_reason,
+        extraction_quality=quality,
+        extraction_source=meta.get("source", ""),
+        extraction_meta=meta,
     )
 
 

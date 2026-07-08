@@ -72,18 +72,22 @@ class Verdict(Enum):
     STRONG_OK = "strong_ok"        # positive proof present → terminal success
     WEAK_OK = "weak_ok"            # clean, no negative signal → terminal success
     SUSPECT_OK = "suspect_ok"      # ambiguous (abck unresolved / soft) → NON-terminal
+    JS_SHELL = "js_shell"          # empty SPA mount point → NON-terminal (Playwright)
     CHALLENGE = "challenge"        # WAF challenge (negative proof)
     BLOCKED = "blocked"            # generic non-2xx block
     RATE_LIMITED = "rate_limited"  # 429 — back off, do not hammer
     AUTH_REQUIRED = "auth_required"  # 401/407 — terminal, retrying TLS won't help
     NOT_FOUND = "not_found"        # 404/410 — terminal
+    BOT_WALL_SUSPECTED = "bot_wall"  # non-2xx + challenge markers → terminal
     UNKNOWN = "unknown"            # exception / dependency missing
 
 
 # Verdicts that mean "stop the grid — more TLS attempts cannot help".
 TERMINAL_NONSUCCESS = frozenset({
     Verdict.AUTH_REQUIRED, Verdict.NOT_FOUND, Verdict.RATE_LIMITED,
+    Verdict.BOT_WALL_SUSPECTED,
 })
+# JS_SHELL is intentionally NON-terminal so the chain queues Playwright fallback.
 
 
 @dataclass
@@ -171,6 +175,50 @@ def _looks_complete_content_page(text: str, lowered: str) -> bool:
     return len(visible) >= 64
 
 
+# JS app mount points + framework markers. A 2xx with one of these but little
+# visible body text is an unrendered SPA shell that needs Playwright.
+_JS_APP_MOUNT_RE = re.compile(
+    r"""<[^>]+id=["'](?:app|root|__next|__nuxt|___gatsby|svelte)["'][^>]*>\s*</[^>]+>""",
+    re.I | re.S)
+# Framework-specific markers (NOT a bare <script> — too generic, matches WAF
+# challenge pages that load /cdn-cgi/challenge.js). Require evidence of a
+# known SPA framework: data-reactroot, ng-version, __NEXT_DATA__ script tag,
+# or an explicit SPA root id.
+_JS_FRAMEWORK_RE = re.compile(
+    r"""(data-reactroot|__NEXT_DATA__|ng-version|id=["'](?:app|root|__next|__nuxt|___gatsby|svelte)["'])""",
+    re.I | re.S)
+
+
+def _visible_text_len(body: str) -> int:
+    """Length of meaningful visible text after stripping scripts/styles/tags."""
+    t = re.sub(r"(?is)<(script|style|noscript|svg|template)[^>]*>.*?</\1>", " ", body)
+    t = re.sub(r"(?s)<[^>]+>", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return len(t)
+
+
+def _looks_like_js_shell(body: str) -> bool:
+    """True if HTML carries a JS app mount point but no meaningful body text
+    (Next/Nuxt/Gatsby SPA shell that needs Playwright to render).
+
+    Two paths:
+      1. Explicit empty mount element (`<div id="root"></div>` etc.) — high
+         signal on its own, returns True regardless of size.
+      2. Framework marker (data-reactroot / __NEXT_DATA__ / ng-version / SPA
+         root id) AND under 200 chars of visible text — the SPA emitted its
+         bootstrap shell but no rendered content yet.
+
+    A bare `<script src=...>` is NOT enough — too generic (matches Cloudflare
+    challenge pages, ad scripts, analytics, etc.)."""
+    if not body:
+        return False
+    if _JS_APP_MOUNT_RE.search(body):
+        return True
+    if len(body) >= 3000:
+        return False
+    return bool(_JS_FRAMEWORK_RE.search(body)) and _visible_text_len(body) < 200
+
+
 def _selector_hits(body: str, selectors: list[str]) -> Optional[list[str]]:
     """Return matched-selector list, or None if BS4 is unavailable."""
     if BeautifulSoup is None:
@@ -234,6 +282,14 @@ def validate(
     # --- Layer 2: HARD markers (decisive) ---------------------------------
     hard = _hard_marker_hits(lowered)
     if hard:
+        # A non-2xx (e.g. 403) carrying a hard challenge marker is a real bot
+        # wall: retrying TLS cannot help and the body must NOT be cited as
+        # page content. Promote to terminal BOT_WALL_SUSPECTED.
+        if not (200 <= status < 300):
+            r.verdict = Verdict.BOT_WALL_SUSPECTED
+            r.reasons.append(f"bot_wall:status={status}")
+            r.reasons.extend(f"hard:{m}" for m in hard[:3])
+            return r
         r.verdict = Verdict.CHALLENGE
         r.reasons.extend(f"hard:{m}" for m in hard[:3])
         return r
@@ -294,6 +350,14 @@ def validate(
     if soft:
         r.verdict = Verdict.CHALLENGE
         r.reasons.extend(f"soft:{m}" for m in soft[:3])
+        return r
+
+    # JS shell detection runs BEFORE the tiny-body heuristic: a small body
+    # carrying a React/Next mount point is an unrendered SPA, not a challenge
+    # stub. Promote to non-terminal JS_SHELL so the chain queues Playwright.
+    if _looks_like_js_shell(text):
+        r.verdict = Verdict.JS_SHELL
+        r.reasons.append("js_shell_detected")
         return r
 
     if size < SMALL_BODY_THRESHOLD:

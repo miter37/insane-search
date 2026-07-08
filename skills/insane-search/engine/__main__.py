@@ -37,6 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Per-attempt timeout seconds (default 25).")
     p.add_argument("--max-attempts", type=int, default=None,
                    help="TOTAL curl-attempt budget. Default: None = exhaustive (honours R6).")
+    p.add_argument("--max-download-mb", type=int, default=8,
+                   help="Hard cap on body bytes per attempt in MB (default 8).")
+    p.add_argument("--no-retry", action="store_true",
+                   help="Disable transient-status retry (429/502/503/504) on the same identity.")
+    p.add_argument("--no-extract", action="store_true",
+                   help="Return raw response text instead of running the markdown extraction chain.")
     p.add_argument("--no-playwright", action="store_true",
                    help="Skip Playwright fallback (curl-only).")
     p.add_argument("--no-phase0", action="store_true",
@@ -59,6 +65,9 @@ def main(argv: list[str] | None = None) -> int:
             max_attempts=args.max_attempts,
             enable_playwright=not args.no_playwright,
             enable_phase0=not args.no_phase0,
+            enable_extraction=not args.no_extract,
+            enable_retry=not args.no_retry,
+            max_download_bytes=(args.max_download_mb * 1024 * 1024) if args.max_download_mb else None,
         )
     except Exception as e:
         print(f"engine fatal: {type(e).__name__}: {e}", file=sys.stderr)

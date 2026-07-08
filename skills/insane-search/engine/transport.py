@@ -17,9 +17,23 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import urlsplit
+
+
+# Hard cap on downloaded body bytes per single attempt. Protects against OOM
+# on misconfigured endpoints / WAF DoS bodies / oversized media. Mirrors the
+# deepfetch MAX_HTML_BYTES default.
+MAX_DOWNLOAD_BYTES_DEFAULT = 8 * 1024 * 1024
+
+# Transient statuses that justify an exponential-backoff retry on the SAME
+# identity (a different TLS family does not help with rate-limit recovery).
+_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+_RETRY_MAX_ATTEMPTS_DEFAULT = 2
+_RETRY_BASE_DELAY = 1.5       # seconds; backoff = base * (factor ** attempt)
+_RETRY_FACTOR = 2.0
 
 
 def _host_of(url: str) -> str:
@@ -118,16 +132,28 @@ class SessionPool:
     def request(self, url: str, *, impersonate: str, referer: str = "",
                 timeout: int = 25, extra_headers: Optional[dict] = None,
                 allow_private: Optional[bool] = None,
-                max_redirects: Optional[int] = None) -> tuple[Any, Optional[str]]:
+                max_redirects: Optional[int] = None,
+                max_download_bytes: Optional[int] = None,
+                max_retries: Optional[int] = None) -> tuple[Any, Optional[str]]:
         """GET via the pooled session (cookie + connection reuse), with an SSRF
         guard: the initial URL and EVERY redirect hop are validated against the
         private/loopback/link-local/metadata block-list before being fetched.
-        Falls back to a one-shot get if no session could be created."""
+        Falls back to a one-shot get if no session could be created.
+
+        Transient statuses (429/502/503/504) are retried in-place with
+        exponential backoff before the caller sees the response — this is the
+        gap a pure TLS-grid rotation cannot close (different identity does not
+        help with rate-limit recovery). A hard size cap streams the body and
+        marks ``resp._truncated_download`` when hit."""
         from . import safety
         if allow_private is None:
             allow_private = safety.allow_private_default()
         if max_redirects is None:
             max_redirects = safety.DEFAULT_MAX_REDIRECTS
+        if max_download_bytes is None:
+            max_download_bytes = MAX_DOWNLOAD_BYTES_DEFAULT
+        if max_retries is None:
+            max_retries = _RETRY_MAX_ATTEMPTS_DEFAULT
 
         ok, reason = safety.classify_url(url, allow_private)
         if not ok:
@@ -150,26 +176,45 @@ class SessionPool:
             except ImportError:
                 return None, "curl_cffi not installed"
             def _do_get(u):
-                return cffi_requests.get(u, impersonate=impersonate, headers=headers,
-                                         timeout=timeout, allow_redirects=False)
-            return self._fetch_following(_do_get, url, allow_private, max_redirects, None)
+                return _get_with_size_cap(
+                    lambda x: cffi_requests.get(
+                        x, impersonate=impersonate, headers=headers,
+                        timeout=timeout, allow_redirects=False),
+                    u, max_download_bytes)
+            return self._fetch_following(
+                _do_get, url, allow_private, max_redirects, None,
+                max_retries=max_retries)
 
         if ent.injected_ua:
             headers.setdefault("User-Agent", ent.injected_ua)
         def _do_get(u):
-            return ent.session.get(u, headers=headers, timeout=timeout, allow_redirects=False)
-        return self._fetch_following(_do_get, url, allow_private, max_redirects, ent)
+            return _get_with_size_cap(
+                lambda x: ent.session.get(
+                    x, headers=headers, timeout=timeout, allow_redirects=False),
+                u, max_download_bytes)
+        return self._fetch_following(
+            _do_get, url, allow_private, max_redirects, ent,
+            max_retries=max_retries)
 
     @staticmethod
     def _fetch_following(do_get, url: str, allow_private: bool, max_redirects: int,
-                         ent) -> tuple[Any, Optional[str]]:
+                         ent, *, max_retries: int = 0) -> tuple[Any, Optional[str]]:
         """Manually follow redirects so each hop is SSRF-validated (curl_cffi's
-        own allow_redirects=True would skip the per-hop check)."""
+        own allow_redirects=True would skip the per-hop check).
+
+        The FIRST attempt on the original URL is wrapped in an exponential-
+        backoff retry loop for transient statuses (429/502/503/504). Redirect
+        hops are NOT retried (they are distinct URLs)."""
         from . import safety
         cur = url
+        first = True
         for _ in range(max_redirects + 1):
             try:
-                resp = do_get(cur)
+                if first and max_retries > 0:
+                    resp = _retry_transient(do_get, cur, max_retries)
+                else:
+                    resp = do_get(cur)
+                first = False
             except Exception as e:
                 return None, f"{type(e).__name__}:{str(e)[:200]}"
             if ent is not None:
@@ -211,3 +256,56 @@ POOL = SessionPool()
 
 def pool_enabled() -> bool:
     return os.environ.get("INSANE_NO_SESSION_POOL", "") not in ("1", "true", "yes")
+
+
+# ── Body size cap (Tier 1-5) ───────────────────────────────────────────────
+def _get_with_size_cap(do_get_raw, url: str, max_bytes: int):
+    """Run ``do_get_raw(url)`` and clamp the resulting body to ``max_bytes``.
+
+    curl_cffi loads the full body into ``resp.content`` on access. We truncate
+    in-place (``content`` is a plain instance attribute, not a property) and
+    tag ``resp._truncated_download`` so callers can tell a clipped download
+    from a complete one. The response object is always returned (the caller's
+    verdict classifier needs the status even on a clipped body)."""
+    resp = do_get_raw(url)
+    if resp is None:
+        return None
+    try:
+        content = getattr(resp, "content", None)
+        if isinstance(content, (bytes, bytearray)) and len(content) > max_bytes:
+            truncated = bytes(content[:max_bytes])
+            try:
+                resp.content = truncated
+            except Exception:
+                pass
+            try:
+                resp.text = truncated.decode("utf-8", "replace")
+            except Exception:
+                pass
+            try:
+                resp._truncated_download = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return resp
+
+
+# ── Retry-with-backoff for transient statuses (Tier 1-3) ───────────────────
+def _retry_transient(do_get, url: str, max_attempts: int,
+                     retry_statuses: frozenset = _RETRY_STATUSES,
+                     base: float = _RETRY_BASE_DELAY,
+                     factor: float = _RETRY_FACTOR) -> Any:
+    """Call ``do_get(url)`` up to ``max_attempts + 1`` times. On a transient
+    status (429/502/503/504) sleep ``base * factor ** attempt`` and retry the
+    SAME identity. Returns the last response (caller classifies verdict)."""
+    resp = do_get(url)
+    for attempt in range(max_attempts):
+        if resp is None:
+            break
+        status = getattr(resp, "status_code", 0) or 0
+        if status not in retry_statuses:
+            break
+        time.sleep(base * (factor ** attempt))
+        resp = do_get(url)
+    return resp
